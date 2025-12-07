@@ -1,0 +1,9 @@
+[package]
+name = "webcrawler"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+lol_html = "2.7.0"
+ureq = "3.1.4"
+url = "2.5.7"
