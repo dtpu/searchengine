@@ -1,19 +1,24 @@
 mod parser;
+mod url_store;
+mod writer;
+mod http_client;
+mod rate_limiter;
+mod ui;
 
-use reqwest;
-use std::collections::HashSet;
 use tokio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tokio::sync::Mutex;
 use futures::StreamExt;
-use tokio_stream::wrappers::UnboundedReceiverStream;
-use tokio::fs::OpenOptions;
-use tokio::io::AsyncWriteExt;
-use serde_json;
+use tokio_stream::wrappers::ReceiverStream;
+use url_store::UrlStore;
+use writer::BufferedWriter;
+use http_client::HttpClient;
+use rate_limiter::RateLimiter;
+use tokio::sync::mpsc;
 
-const MAX_PAGES: usize = 1000;
+const MAX_PAGES: usize = 1_000_000;
 const CONCURRENCY: usize = 50;
+const CHANNEL_BUFFER: usize = 10_000;
 
 #[tokio::main]
 async fn main() {
@@ -21,106 +26,173 @@ async fn main() {
         "https://student.cs.uwaterloo.ca/~cs145/".to_string()
     ];
     
-    // Create JSONL output file
-    let output_file = Arc::new(Mutex::new(
-        OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("crawled_pages.jsonl")
-            .await
-            .expect("Failed to create output file")
+    let (writer, writer_tx) = BufferedWriter::new("crawled_pages.jsonl")
+        .expect("Failed to create buffered writer");
+    tokio::spawn(writer.run());
+    
+    let http_client = Arc::new(HttpClient::new().expect("Failed to create HTTP client"));
+    let rate_limiter = RateLimiter::new();
+    let url_store = UrlStore::new("./visited_urls.db")
+        .expect("Failed to open URL store");
+    
+    // Load existing page count from database
+    let existing_pages = url_store.get_pages_crawled();
+    let pages_count = Arc::new(AtomicUsize::new(existing_pages));
+    let pages_written = Arc::new(AtomicUsize::new(0));
+    let queue_size = Arc::new(AtomicUsize::new(0));
+    
+    // Check existing frontier before adding seeds
+    let existing_frontier = url_store.frontier_count();
+    eprintln!("Found {} URLs in frontier from previous run", existing_frontier);
+    eprintln!("Already crawled {} pages", existing_pages);
+    
+    // Add seeds to frontier (only if not already visited)
+    let mut seeds_added = 0;
+    for seed in seeds {
+        if url_store.add_to_frontier(&seed) {
+            seeds_added += 1;
+        }
+    }
+    eprintln!("Added {} seed URLs to frontier", seeds_added);
+    
+    // Check frontier size
+    let initial_frontier = url_store.frontier_count();
+    eprintln!("Total URLs in frontier: {}", initial_frontier);
+    if initial_frontier == 0 {
+        eprintln!("No URLs in frontier. All URLs have been crawled.");
+        return;
+    }
+    
+    let stats = Arc::new(ui::CrawlerStats::new(
+        pages_count.clone(),
+        pages_written.clone(),
+        queue_size.clone(),
     ));
     
-    let visited = Arc::new(Mutex::new(HashSet::new()));
-    let pages_count = Arc::new(AtomicUsize::new(0));
-    
-    // Two channels: one for discovered URLs, one for processing
-    let (discovered_tx, mut discovered_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    let (processing_tx, processing_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    
-    let discovered_tx = Arc::new(discovered_tx);
-    let processing_tx = Arc::new(processing_tx);
-    
-    // Task to batch and forward URLs from discovered -> processing
-    let batch_task = tokio::spawn({
-        let processing_tx = processing_tx.clone();
+    let ui_task = tokio::spawn({
+        let stats = stats.clone();
         async move {
-            while let Some(link) = discovered_rx.recv().await {
-                // You can add batching logic here if needed
-                let _ = processing_tx.send(link);
+            if let Err(e) = ui::run_ui(stats, MAX_PAGES).await {
+                eprintln!("UI error: {}", e);
             }
         }
     });
     
-    // Add seeds to visited and queue them
-    {
-        let mut visited_lock = visited.lock().await;
-        for seed in seeds {
-            if visited_lock.insert(seed.clone()) {
-                discovered_tx.send(seed).expect("Failed to enqueue seed");
+    let (discovered_tx, mut discovered_rx) = mpsc::channel::<String>(CHANNEL_BUFFER);
+    let (processing_tx, processing_rx) = mpsc::channel::<String>(CHANNEL_BUFFER);
+    
+    let discovered_tx = Arc::new(discovered_tx);
+    let processing_tx = Arc::new(processing_tx);
+    
+    // Task to add discovered URLs to frontier and forward to processing
+    let frontier_task = tokio::spawn({
+        let url_store = url_store.clone();
+        let processing_tx = processing_tx.clone();
+        let queue_size = queue_size.clone();
+        async move {
+            while let Some(link) = discovered_rx.recv().await {
+                if url_store.add_to_frontier(&link) {
+                    queue_size.fetch_add(1, Ordering::Relaxed);
+                    let _ = processing_tx.send(link).await;
+                }
             }
         }
-    }
+    });
     
-    println!("Starting crawl with limit of {} pages...", MAX_PAGES);
+    // Seed the processing queue with URLs from frontier
+    let url_store_clone = url_store.clone();
+    let processing_tx_clone = processing_tx.clone();
+    let queue_size_clone = queue_size.clone();
+    tokio::spawn(async move {
+        let batch_size = 100;
+        let mut loaded = 0;
+        while loaded < batch_size {
+            if let Some(url) = url_store_clone.pop_from_frontier() {
+                queue_size_clone.fetch_add(1, Ordering::Relaxed);
+                let _ = processing_tx_clone.send(url).await;
+                loaded += 1;
+            } else {
+                break;
+            }
+        }
+    });
     
-    // Process URLs concurrently using a stream
-    UnboundedReceiverStream::new(processing_rx)
+    ReceiverStream::new(processing_rx)
         .for_each_concurrent(CONCURRENCY, |url| {
-            let visited = visited.clone();
+            let url_store = url_store.clone();
             let pages_count = pages_count.clone();
+            let pages_written = pages_written.clone();
+            let queue_size = queue_size.clone();
             let discovered_tx = discovered_tx.clone();
-            let output_file = output_file.clone();
+            let writer_tx = writer_tx.clone();
+            let http_client = http_client.clone();
+            let rate_limiter = rate_limiter.clone();
+            let stats = stats.clone();
+            let processing_tx = processing_tx.clone();
             
             async move {
+                queue_size.fetch_sub(1, Ordering::Relaxed);
+                
                 let current_count = pages_count.fetch_add(1, Ordering::Relaxed) + 1;
-                if current_count > MAX_PAGES {
+                if current_count > MAX_PAGES || stats.should_stop() {
                     return;
                 }
                 
-                match process_link(url, output_file).await {
-                    Some(child_links) => {
-                        // Add discovered links to visited set and queue
+                match process_link(url.clone(), http_client, rate_limiter, writer_tx).await {
+                    Ok((parsed, child_links)) => {
+                        pages_written.fetch_add(1, Ordering::Relaxed);
+                        
+                        // Persist page count every 10 pages
+                        let current = pages_count.load(Ordering::Relaxed);
+                        if current % 10 == 0 {
+                            url_store.set_pages_crawled(current);
+                        }
+                        
+                        if let Some(canonical) = &parsed.canonical_url {
+                            if canonical != &parsed.url {
+                                url_store.mark_visited(canonical);
+                            }
+                        }
+                        
                         for link in child_links {
-                            let mut visited_lock = visited.lock().await;
-                            if visited_lock.insert(link.clone()) {
-                                let _ = discovered_tx.send(link);
+                            let _ = discovered_tx.send(link).await;
+                        }
+                        
+                        // Load more URLs from frontier
+                        if queue_size.load(Ordering::Relaxed) < CHANNEL_BUFFER / 2 {
+                            if let Some(next_url) = url_store.pop_from_frontier() {
+                                queue_size.fetch_add(1, Ordering::Relaxed);
+                                let _ = processing_tx.send(next_url).await;
                             }
                         }
                     }
-                    None => {
-                        eprintln!("Failed to process link");
+                    Err(e) => {
+                        stats.add_error(format!("{}: {}", url, e));
                     }
                 }
             }
         })
         .await;
     
-    batch_task.await.unwrap();
+    // Save final page count
+    url_store.set_pages_crawled(pages_count.load(Ordering::Relaxed));
     
-    println!("Crawl complete! Processed {} pages", pages_count.load(Ordering::Relaxed));
-    println!("Results saved to crawled_pages.jsonl");
+    frontier_task.await.unwrap();
+    ui_task.await.unwrap();
 }
 
-async fn process_link(link: String, output_file: Arc<Mutex<tokio::fs::File>>) -> Option<Vec<String>> {
-    println!("Processing: {}", link);
+async fn process_link(
+    link: String,
+    http_client: Arc<HttpClient>,
+    rate_limiter: RateLimiter,
+    writer_tx: mpsc::Sender<parser::ParsedHtml>,
+) -> Result<(parser::ParsedHtml, Vec<String>), Box<dyn std::error::Error>> {
+    rate_limiter.wait_if_needed(&link).await;
+    let html_content = http_client.fetch(&link).await?;
+    let parsed = parser::parse_html(html_content, &link);
+    let links: Vec<String> = parsed.links.clone();
     
-    let request = reqwest::get(&link).await;
-    if let Ok(response) = request {
-        let html_content = response.text().await.ok()?;
-        let parsed = parser::parse_html(html_content, &link);
-        
-        // Write parsed data as JSON line
-        let json_line = serde_json::to_string(&parsed).ok()?;
-        let mut file = output_file.lock().await;
-        file.write_all(json_line.as_bytes()).await.ok()?;
-        file.write_all(b"\n").await.ok()?;
-        
-        let links: Vec<String> = parsed.links.into_iter().collect();
-        println!("Found {} links", links.len());
-        
-        Some(links)
-    } else {
-        None
-    }
+    writer_tx.send(parsed.clone()).await?;
+    
+    Ok((parsed, links))
 }

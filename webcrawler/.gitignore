@@ -1,2 +1,4 @@
 target
 .vscode
+crawled_pages.jsonl
+visited_urls.db

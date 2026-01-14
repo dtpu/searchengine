@@ -2,13 +2,13 @@ use lol_html::{element, text, HtmlRewriter, Settings};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct MetaTag {
     pub name: String,
     pub content: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ParsedHtml {
     pub url: String,
     pub language: Option<String>,
@@ -65,14 +65,16 @@ pub fn parse_html(input: String, base_url: &str) -> ParsedHtml {
                 // Extract links
                 element!("a[href]", |el| {
                     if let Some(attached_url) = el.get_attribute("href") {
-                        if let Ok(attached_url) = Url::parse(&attached_url) {
-                            if attached_url.scheme() == "http" || attached_url.scheme() == "https" {
-                                links.push(attached_url.to_string());
-                                return Ok(());
+                        if let Ok(parsed_url) = Url::parse(&attached_url) {
+                            if parsed_url.scheme() == "http" || parsed_url.scheme() == "https" {
+                                links.push(parsed_url.to_string());
                             }
+                            return Ok(());
                         }
                         if let Ok(joined_url) = base_url_parsed.join(&attached_url) {
-                            links.push(joined_url.to_string());
+                            if joined_url.scheme() == "http" || joined_url.scheme() == "https" {
+                                links.push(joined_url.to_string());
+                            }
                         }
                     }
                     Ok(())
