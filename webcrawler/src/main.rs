@@ -5,9 +5,10 @@ mod http_client;
 mod rate_limiter;
 mod ui;
 
-use tokio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::fs;
+use std::time::Duration;
 use futures::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 use url_store::UrlStore;
@@ -17,22 +18,25 @@ use rate_limiter::RateLimiter;
 use tokio::sync::mpsc;
 
 const MAX_PAGES: usize = 1_000_000;
-const CONCURRENCY: usize = 50;
+const CONCURRENCY: usize = 1_000;
 const CHANNEL_BUFFER: usize = 10_000;
 
 #[tokio::main]
 async fn main() {
+    // Create output directory if it doesn't exist
+    fs::create_dir_all("output").expect("Failed to create output directory");
+    
     let seeds = vec![
-        "https://student.cs.uwaterloo.ca/~cs145/".to_string()
+        "https://en.wikipedia.org/wiki/Full-text_search".to_string()
     ];
     
-    let (writer, writer_tx) = BufferedWriter::new("crawled_pages.jsonl")
+    let (writer, writer_tx) = BufferedWriter::new("output/crawled_pages.jsonl")
         .expect("Failed to create buffered writer");
     tokio::spawn(writer.run());
     
     let http_client = Arc::new(HttpClient::new().expect("Failed to create HTTP client"));
     let rate_limiter = RateLimiter::new();
-    let url_store = UrlStore::new("./visited_urls.db")
+    let url_store = UrlStore::new("output/visited_urls.db")
         .expect("Failed to open URL store");
     
     // Load existing page count from database
@@ -84,17 +88,13 @@ async fn main() {
     let discovered_tx = Arc::new(discovered_tx);
     let processing_tx = Arc::new(processing_tx);
     
-    // Task to add discovered URLs to frontier and forward to processing
+    // Task to add discovered URLs to frontier (workers will pull as needed)
     let frontier_task = tokio::spawn({
         let url_store = url_store.clone();
-        let processing_tx = processing_tx.clone();
-        let queue_size = queue_size.clone();
         async move {
             while let Some(link) = discovered_rx.recv().await {
-                if url_store.add_to_frontier(&link) {
-                    queue_size.fetch_add(1, Ordering::Relaxed);
-                    let _ = processing_tx.send(link).await;
-                }
+                // Just persist to DB, don't send to processing channel
+                url_store.add_to_frontier(&link);
             }
         }
     });
@@ -103,16 +103,28 @@ async fn main() {
     let url_store_clone = url_store.clone();
     let processing_tx_clone = processing_tx.clone();
     let queue_size_clone = queue_size.clone();
+    let stats_clone = stats.clone();
     tokio::spawn(async move {
-        let batch_size = 100;
-        let mut loaded = 0;
-        while loaded < batch_size {
-            if let Some(url) = url_store_clone.pop_from_frontier() {
-                queue_size_clone.fetch_add(1, Ordering::Relaxed);
-                let _ = processing_tx_clone.send(url).await;
-                loaded += 1;
+        loop {
+            // Keep queue fed with URLs from frontier
+            let current_queue = queue_size_clone.load(Ordering::Relaxed);
+            if current_queue < CHANNEL_BUFFER / 2 && !stats_clone.should_stop() {
+                if let Some(url) = url_store_clone.pop_from_frontier() {
+                    match processing_tx_clone.try_send(url) {
+                        Ok(_) => {
+                            queue_size_clone.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(_) => {
+                            // Channel full, wait a bit
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                    }
+                } else {
+                    // Frontier empty, wait for discovered URLs
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
             } else {
-                break;
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
     });
@@ -128,13 +140,14 @@ async fn main() {
             let http_client = http_client.clone();
             let rate_limiter = rate_limiter.clone();
             let stats = stats.clone();
-            let processing_tx = processing_tx.clone();
             
             async move {
                 queue_size.fetch_sub(1, Ordering::Relaxed);
+                stats.active_workers.fetch_add(1, Ordering::Relaxed);
                 
                 let current_count = pages_count.fetch_add(1, Ordering::Relaxed) + 1;
                 if current_count > MAX_PAGES || stats.should_stop() {
+                    stats.active_workers.fetch_sub(1, Ordering::Relaxed);
                     return;
                 }
                 
@@ -142,34 +155,30 @@ async fn main() {
                     Ok((parsed, child_links)) => {
                         pages_written.fetch_add(1, Ordering::Relaxed);
                         
+                        // Track domain
+                        stats.increment_domain(&url);
+                        
                         // Persist page count every 10 pages
                         let current = pages_count.load(Ordering::Relaxed);
-                        if current % 10 == 0 {
+                        if current.is_multiple_of(10) {
                             url_store.set_pages_crawled(current);
                         }
                         
-                        if let Some(canonical) = &parsed.canonical_url {
-                            if canonical != &parsed.url {
-                                url_store.mark_visited(canonical);
-                            }
+                        if let Some(canonical) = &parsed.canonical_url
+                            && canonical != &parsed.url {
+                            url_store.mark_visited(canonical);
                         }
                         
                         for link in child_links {
                             let _ = discovered_tx.send(link).await;
-                        }
-                        
-                        // Load more URLs from frontier
-                        if queue_size.load(Ordering::Relaxed) < CHANNEL_BUFFER / 2 {
-                            if let Some(next_url) = url_store.pop_from_frontier() {
-                                queue_size.fetch_add(1, Ordering::Relaxed);
-                                let _ = processing_tx.send(next_url).await;
-                            }
                         }
                     }
                     Err(e) => {
                         stats.add_error(format!("{}: {}", url, e));
                     }
                 }
+                
+                stats.active_workers.fetch_sub(1, Ordering::Relaxed);
             }
         })
         .await;

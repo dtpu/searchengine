@@ -48,10 +48,9 @@ impl BufferedWriter {
                 continue;
             }
             
-            if self.should_flush() {
-                if let Err(e) = self.flush() {
-                    eprintln!("Failed to flush batch: {}", e);
-                }
+            if self.should_flush()
+                && let Err(e) = self.flush() {
+                eprintln!("Failed to flush batch: {}", e);
             }
         }
         

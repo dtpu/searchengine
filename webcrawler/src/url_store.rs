@@ -74,7 +74,7 @@ impl UrlStore {
             .unwrap()
             .as_secs()
             .to_le_bytes();
-        self.db.put_cf(frontier_cf, key, &timestamp).unwrap_or_else(|e| {
+        self.db.put_cf(frontier_cf, key, timestamp).unwrap_or_else(|e| {
             eprintln!("Failed to add URL to frontier: {}", e);
         });
         true
@@ -96,7 +96,7 @@ impl UrlStore {
                 .unwrap()
                 .as_secs()
                 .to_le_bytes();
-            self.db.put_cf(visited_cf, &key, &timestamp).ok();
+            self.db.put_cf(visited_cf, &key, timestamp).ok();
             self.db.delete_cf(frontier_cf, &key).ok();
             
             Some(url)
@@ -115,11 +115,10 @@ impl UrlStore {
     /// Get pages crawled count from database
     pub fn get_pages_crawled(&self) -> usize {
         let visited_cf = self.db.cf_handle("visited").unwrap();
-        if let Ok(Some(bytes)) = self.db.get_cf(visited_cf, b"__stats_pages_crawled__") {
-            if bytes.len() == 8 {
-                let array: [u8; 8] = bytes[..8].try_into().unwrap_or([0u8; 8]);
-                return usize::from_le_bytes(array);
-            }
+        if let Ok(Some(bytes)) = self.db.get_cf(visited_cf, b"__stats_pages_crawled__")
+            && bytes.len() == 8 {
+            let array: [u8; 8] = bytes[..8].try_into().unwrap_or([0u8; 8]);
+            return usize::from_le_bytes(array);
         }
         0
     }
@@ -127,7 +126,7 @@ impl UrlStore {
     /// Update pages crawled count in database
     pub fn set_pages_crawled(&self, count: usize) {
         let visited_cf = self.db.cf_handle("visited").unwrap();
-        self.db.put_cf(visited_cf, b"__stats_pages_crawled__", &count.to_le_bytes()).ok();
+        self.db.put_cf(visited_cf, b"__stats_pages_crawled__", count.to_le_bytes()).ok();
     }
     
     /// Mark a URL as visited (for canonical URLs)
@@ -141,7 +140,7 @@ impl UrlStore {
             .unwrap()
             .as_secs()
             .to_le_bytes();
-        self.db.put_cf(visited_cf, key, &timestamp).ok();
+        self.db.put_cf(visited_cf, key, timestamp).ok();
     }
     
     /// Normalize URL to reduce duplicates

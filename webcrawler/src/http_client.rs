@@ -34,10 +34,9 @@ impl HttpClient {
             }
         }
         
-        if let Some(content_length) = response.content_length() {
-            if content_length > MAX_RESPONSE_SIZE as u64 {
-                return Err(FetchError::TooLarge(content_length));
-            }
+        if let Some(content_length) = response.content_length()
+            && content_length > MAX_RESPONSE_SIZE as u64 {
+            return Err(FetchError::TooLarge(content_length));
         }
         
         let body = response.text().await?;
