@@ -1,0 +1,8 @@
+services:
+  nats-queue:
+    image: nats:alpine
+    container_name: nats-queue
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    command: ["-js"]

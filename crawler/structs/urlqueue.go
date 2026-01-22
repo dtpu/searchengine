@@ -26,29 +26,38 @@ type UrlQueue struct {
     cancel    context.CancelFunc
 }
 
-func InitializeQueue() (*UrlQueue, error) {
-    ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+func InitializeQueue(nats_url string) (*UrlQueue, error) {
+    ctx, cancel := context.WithCancel(context.Background()) // Changed from WithTimeout
 
-	nc, err := nats.Connect(nats.DefaultURL)
+	nc, err := nats.Connect(nats_url, 
+        nats.Timeout(3*time.Second),
+        nats.MaxReconnects(3),
+        nats.ReconnectWait(1*time.Second),
+    )
     if err != nil {
         cancel()
         return nil, fmt.Errorf("failed to connect to NATS: %w", err)
     }
+    
+    // only for initialization
+    initCtx, initCancel := context.WithTimeout(context.Background(), 30*time.Second)
+    defer initCancel()
+    
     js, err := jetstream.New(nc)
     if err != nil {
         cancel()
         nc.Close()
         return nil, fmt.Errorf("failed to create JetStream context: %w", err)
     }
-    
-    st, err := js.Stream(ctx, stream_name)
+
+    st, err := js.Stream(initCtx, stream_name)
     if err != nil {
-        // Stream doesn't exist, create it
-        st, err = js.CreateStream(ctx, jetstream.StreamConfig{
+        // create if not exists (for first run)
+        st, err = js.CreateStream(initCtx, jetstream.StreamConfig{
             Name:     stream_name,
             Subjects: []string{subject_prefix + ".*"},
-            Retention: jetstream.WorkQueuePolicy, // for work queue
-            Storage:   jetstream.FileStorage,     // persist
+            Retention: jetstream.WorkQueuePolicy,
+            Storage:   jetstream.FileStorage,
         })
         if err != nil {
             cancel()
@@ -56,11 +65,22 @@ func InitializeQueue() (*UrlQueue, error) {
             return nil, fmt.Errorf("failed to create stream: %w", err)
         }
     }
+
+    c, err := st.Consumer(initCtx, consumer_name)
+    if err != nil {
+        // Consumer doesn't exist, create it
+        c, err = st.CreateConsumer(initCtx, jetstream.ConsumerConfig{
+            Durable:       consumer_name,
+            AckPolicy:     jetstream.AckExplicitPolicy,
+            FilterSubject: subject_prefix + ".new",
+        })
+        if err != nil {
+            cancel()
+            nc.Close()
+            return nil, fmt.Errorf("failed to create consumer: %w", err)
+        }
+    }
     
-    c, err := st.CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
-        Durable:   "CONS",
-        AckPolicy: jetstream.AckExplicitPolicy,
-    })
     if err != nil {
         cancel()
         nc.Close()
@@ -74,15 +94,6 @@ func InitializeQueue() (*UrlQueue, error) {
         return nil, fmt.Errorf("failed to create message iterator: %w", err)
     }
 
-    defer func () {
-        cancel()
-        iter.Drain()
-        iter.Stop()
-        js.CleanupPublisher()
-        nc.Drain()
-        nc.Close()
-    }()
-    
     return &UrlQueue{
         nc:       nc,
         js:       js,
@@ -138,13 +149,17 @@ func (uq *UrlQueue) Dequeue() (jetstream.Msg, error) {
     return msg, nil
 }
 
-func (uq *UrlQueue) QueueSize() (uint64, error) {
+func (uq *UrlQueue) Empty() (bool) {
+    return uq.QueueSize() == 0
+}
+
+func (uq *UrlQueue) QueueSize() (uint64) {
     info, err := uq.consumer.Info(uq.ctx)
     if err != nil {
-        return 0, fmt.Errorf("failed to get consumer info: %w", err)
+        panic(err) // should not happen
     }
     
-    return info.NumPending, nil
+    return info.NumPending
 }
 
 func (uq *UrlQueue) Close() error {
@@ -162,4 +177,8 @@ func (uq *UrlQueue) Close() error {
     }
     
     return nil
+}
+
+func (uq *UrlQueue) IsHealthy() bool {
+    return uq.nc != nil && uq.nc.IsConnected()
 }
