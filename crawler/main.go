@@ -1,11 +1,12 @@
-// Example using net/http, goroutines, and channels
 package main
 
 import (
 	"log"
 	"net/http"
-	"github.com/dtpu/searchengine/crawler/structs"
+	"os"
+
 	"github.com/dtpu/searchengine/crawler/parser"
+	"github.com/dtpu/searchengine/crawler/structs"
 	"github.com/nats-io/nats.go/jetstream"
 )
 
@@ -37,52 +38,53 @@ func crawl(url string, q *structs.UrlQueue, statsTrackerChan chan<- structs.Stat
 	return nil
 }
 
-func main() {
+func startCrawler() {
 	q, err := structs.InitializeQueue("nats://localhost:4222")
 	if err != nil {
-        panic(err)
-    }
-    defer q.Close()
+		panic(err)
+	}
+	defer q.Close()
 
 	print("Queue size: ", q.QueueSize(), "\n")
 
-    
-    // seed initial URLs
-    q.EnqueueBatch([]string{
-        "https://example.com",
-        "https://danielpu.dev",
-    })
-	
-    sem := make(chan struct{}, NUM_WORKERS)
-    
+	// seed initial URLs
+	q.EnqueueBatch([]string{
+		"https://example.com",
+		"https://danielpu.dev",
+	})
+
+	sem := make(chan struct{}, NUM_WORKERS)
+
 	statsTrackerChan := make(chan structs.StatsEvent, 1000)
 	go structs.StatsTracker(statsTrackerChan, q.QueueSize())
 
-    for {
-        sem <- struct{}{} // wait for worker slot
+	for {
+		sem <- struct{}{} // wait for worker slot
 
-        msg, err := q.Dequeue()
-        if err != nil {
-            <-sem
-            log.Println("Error dequeuing:", err)
-            continue
-        }
-		
-        
-        go func(msg jetstream.Msg) {
-            defer func() { <-sem }()
+		msg, err := q.Dequeue()
+		if err != nil {
+			<-sem
+			log.Println("Error dequeuing:", err)
+			continue
+		}
+
+		go func(msg jetstream.Msg) {
+			defer func() { <-sem }()
 
 			url := string(msg.Data())
-            
 
 			if err := crawl(url, q, statsTrackerChan); err != nil {
-                msg.Nak() // requeue
-            } else {
-                msg.Ack() // success
-            }
-        }(msg)
-    }
+				msg.Nak() // requeue
+			} else {
+				msg.Ack() // success
+			}
+		}(msg)
+	}
+}
 
-	
-
+func main() {
+	if err := runTUI(); err != nil {
+		log.Println("Error running TUI:", err)
+		os.Exit(1)
+	}
 }
