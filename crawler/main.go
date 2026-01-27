@@ -25,7 +25,6 @@ func crawl(url string, q *structs.UrlQueue, statsTrackerChan chan<- structs.Stat
 		return err
 	}
 	for _, link := range parsedHTML.Links {
-		//print(link, "\n")
 		err := q.Enqueue(link)
 		statsTrackerChan <- structs.StatsEvent{Type: "discovered"}
 		if err != nil {
