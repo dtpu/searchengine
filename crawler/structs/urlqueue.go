@@ -7,11 +7,12 @@ import (
     "errors"
     "github.com/nats-io/nats.go/jetstream"
     "github.com/nats-io/nats.go"
+    "github.com/dtpu/searchengine/crawler/parser"
 )
 
 const (
     stream_name    = "CRAWL_QUEUE"
-    subject_prefix = "crawl.urls"
+    subject_prefix = "url."
     consumer_name  = "crawler-worker"
     iter_buffer    = 1000
 )
@@ -72,7 +73,7 @@ func InitializeQueue(nats_url string) (*UrlQueue, error) {
         c, err = st.CreateConsumer(initCtx, jetstream.ConsumerConfig{
             Durable:       consumer_name,
             AckPolicy:     jetstream.AckExplicitPolicy,
-            FilterSubject: subject_prefix + ".new",
+            FilterSubject: subject_prefix + "*",
         })
         if err != nil {
             cancel()
@@ -113,7 +114,11 @@ func (uq *UrlQueue) Enqueue(url string) error {
     ctx, cancel := context.WithTimeout(uq.ctx, 5*time.Second)
     defer cancel()
     
-    _, err := uq.js.Publish(ctx, subject_prefix+".new", []byte(url))
+    domain, err := parser.GetDomain(url)
+    if err != nil {
+        return fmt.Errorf("failed to get domain from URL: %w", err)
+    }
+    _, err = uq.js.Publish(ctx, subject_prefix+domain, []byte(url))
     if err != nil {
         return fmt.Errorf("failed to enqueue URL: %w", err)
     }
@@ -127,7 +132,11 @@ func (uq *UrlQueue) EnqueueBatch(urls []string) error {
     
     for _, url := range urls {
         // Use async publish for better performance
-        _, err := uq.js.PublishAsync(subject_prefix+".new", []byte(url))
+        domain, err := parser.GetDomain(url)
+        if err != nil {
+            return fmt.Errorf("failed to get domain from URL %s: %w", url, err)
+        }
+        _, err = uq.js.PublishAsync(subject_prefix+domain, []byte(url))
         if err != nil {
             return fmt.Errorf("failed to enqueue URL %s: %w", url, err)
         }

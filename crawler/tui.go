@@ -1,3 +1,5 @@
+// vibed
+
 package main
 
 import (
