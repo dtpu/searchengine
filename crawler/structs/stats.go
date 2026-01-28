@@ -15,10 +15,10 @@ type StatsEvent struct {
     Type string  // "crawled", "failed", "discovered"
 }
 
-func StatsTracker(eventChan <-chan StatsEvent, queueSize uint64) {
+func StatsTracker(eventChan <-chan StatsEvent) {
     // counters
     ticker := time.NewTicker(1 * time.Second)
-	stats := Stats{QueueSize: queueSize}
+	stats := Stats{}
     
     for {
         select {

@@ -3,8 +3,6 @@ package main
 import (
 	"log"
 	"net/http"
-	"time"
-
 	"github.com/dtpu/searchengine/crawler/parser"
 	"github.com/dtpu/searchengine/crawler/structs"
 	"github.com/nats-io/nats.go/jetstream"
@@ -53,31 +51,7 @@ func startCrawler() {
 	sem := make(chan struct{}, NUM_WORKERS)
 
 	statsTrackerChan := make(chan structs.StatsEvent, 1000)
-
-	// start stats tracker
-	go func() {
-		stats := structs.Stats{}
-		ticker := time.NewTicker(5 * time.Second)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case event := <-statsTrackerChan:
-				switch event.Type {
-				case "crawled":
-					stats.PagesCrawled++
-				case "failed":
-					stats.PagesFailed++
-				case "discovered":
-					stats.LinksFound++
-				}
-			case <-ticker.C:
-				stats.QueueSize = q.QueueSize()
-				log.Printf("Stats - Crawled: %d, Failed: %d, Links Found: %d, Queue Size: %d\n",
-					stats.PagesCrawled, stats.PagesFailed, stats.LinksFound, stats.QueueSize)
-			}
-		}
-	}()
+	go structs.StatsTracker(statsTrackerChan)
 
 	for {
 		sem <- struct{}{} // wait for worker slot
